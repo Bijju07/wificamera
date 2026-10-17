@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WiFi Live Camera</title>
+<style>
+:root{--bg:#f2f4f7;--card:#fff;--ink:#1b2430;--muted:#5d6878;--line:#d5dce6;--accent:#1f6feb;--ok:#1a7f4b;--bad:#b42318;--warn:#9a6700;}
+@media (prefers-color-scheme: dark){:root{--bg:#0f141b;--card:#18202b;--ink:#e8eef6;--muted:#9aa8ba;--line:#2a3646;--accent:#5b9dff;--ok:#4cc38a;--bad:#f07167;--warn:#f0c060;}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,'Segoe UI',Roboto,sans-serif;line-height:1.5}
+main{max-width:640px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:22px;margin:0 0 4px}
+.lede{color:var(--muted);margin:0 0 16px;font-size:15px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+.card h2{font-size:16px;margin:0 0 8px}
+.steps{margin:0 0 10px 18px;padding:0;color:var(--muted);font-size:14px}
+video{width:100%;background:#000;border-radius:10px;aspect-ratio:4/3;object-fit:cover}
+.placeholder{width:100%;aspect-ratio:4/3;background:#000;border-radius:10px;display:flex;align-items:center;justify-content:center;color:#8a95a5;font-size:15px}
+textarea{width:100%;min-height:96px;font:13px ui-monospace,Menlo,Consolas,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px;margin:6px 0}
+select{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:9px 10px;width:100%}
+button{font:inherit;cursor:pointer;border-radius:8px;padding:10px 14px;border:1px solid var(--accent);background:var(--accent);color:#fff;margin:4px 4px 4px 0}
+button.ghost{background:none;color:var(--ink);border-color:var(--line)}
+button.off{background:var(--bad);border-color:var(--bad)}
+button:disabled{opacity:.5;cursor:not-allowed}
+button:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.status{font-size:15px;margin:8px 0;min-height:22px}
+.status.ok{color:var(--ok)}
+.status.bad{color:var(--bad)}
+.status.warn{color:var(--warn)}
+.perm{font-size:14px;color:var(--muted);margin:4px 0 10px}
+.perm strong{color:var(--ink)}
+.hidden{display:none}
+label{font-size:14px;color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+  <h1>WiFi Live Camera</h1>
+  <p class="lede">Stream a phone's camera to another phone on the same WiFi. No account or server needed.</p>
+
+  <div class="card">
+    <label for="mode">This phone is</label>
+    <select id="mode">
+      <option value="cam">The camera (sends video)</option>
+      <option value="view">The viewer (watches video)</option>
+    </select>
+  </div>
+
+  <!-- CAMERA SIDE -->
+  <section id="camPanel" class="card">
+    <h2>Camera phone</h2>
+    <ol class="steps">
+      <li>Press Start camera and allow access.</li>
+      <li>Copy the code below and send it to the viewer phone.</li>
+      <li>Paste the viewer's reply code and press Connect.</li>
+    </ol>
+
+    <div class="perm">Camera permission: <strong id="permState">checking...</strong></div>
+
+    <div id="camPreview" class="placeholder">Camera is off</div>
+    <video id="localVideo" autoplay playsinline muted class="hidden"></video>
+
+    <div>
+      <button id="camToggle">Start camera</button>
+    </div>
+    <div class="status" id="camStatus"></div>
+
+    <div class="hidden" id="camCodeBox">
+      <label>Code to send to the viewer</label>
+      <textarea id="offerOut" readonly></textarea>
+      <button class="ghost" id="copyOffer">Copy code</button>
+      <label>Reply code from the viewer</label>
+      <textarea id="answerIn" placeholder="Paste the reply code here"></textarea>
+      <button id="connectCam">Connect</button>
+    </div>
+  </section>
+
+  <!-- VIEWER SIDE -->
+  <section id="viewPanel" class="card hidden">
+    <h2>Viewer phone</h2>
+    <ol class="steps">
+      <li>Paste the code from the camera phone.</li>
+      <li>Press Create reply, then copy the reply code and send it back.</li>
+    </ol>
+    <label>Code from the camera phone</label>
+    <textarea id="offerIn" placeholder="Paste the camera code here"></textarea>
+    <button id="makeAnswer">Create reply</button>
+    <div class="hidden" id="replyBox">
+      <label>Reply code to send back</label>
+      <textarea id="answerOut" readonly></textarea>
+      <button class="ghost" id="copyAnswer">Copy reply</button>
+    </div>
+    <video id="remoteVideo" autoplay playsinline class="hidden"></video>
+    <div class="status" id="viewStatus"></div>
+  </section>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+// Empty list: phones on the same WiFi connect directly. Add a STUN server only if they are on different networks.
+const RTC_CONFIG={iceServers:[]};
+
+let localStream=null;   // the camera stream, null when camera is off
+let pc=null;            // peer connection, created once a code is made
+let sender=null;        // video sender, used to swap the track on/off without renegotiating
+let cameraOn=false;
+
+function setStatus(id,text,kind){
+  const el=$(id);
+  el.textContent=text;
+  el.className='status'+(kind?' '+kind:'');
+}
+
+function waitForIce(peer){
+  return new Promise(resolve=>{
+    if(peer.iceGatheringState==='complete') return resolve();
+    peer.addEventListener('icegatheringstatechange',()=>{
+      if(peer.iceGatheringState==='complete') resolve();
+    });
+  });
+}
+
+function encode(desc){ return btoa(unescape(encodeURIComponent(JSON.stringify(desc)))); }
+function decode(text){ return JSON.parse(decodeURIComponent(escape(atob(text.trim())))); }
+
+function showPanel(){
+  const cam=$('mode').value==='cam';
+  $('camPanel').classList.toggle('hidden',!cam);
+  $('viewPanel').classList.toggle('hidden',cam);
+}
+
+/* ---------- Camera permission status ---------- */
+async function checkPermission(){
+  if(!navigator.permissions){ $('permState').textContent='unknown (browser does not report it)'; return; }
+  try{
+    const p=await navigator.permissions.query({name:'camera'});
+    const label={granted:'allowed',denied:'blocked',prompt:'not decided yet'};
+    const show=()=>{
+      $('permState').textContent=label[p.state]||p.state;
+      if(p.state==='denied'){
+        setStatus('camStatus','Camera is blocked for this site. Allow it in the browser settings for this page, then reload.','bad');
+      }
+    };
+    show();
+    p.onchange=show;
+  }catch(err){
+    $('permState').textContent='unknown (browser does not report it)';
+  }
+}
+
+/* ---------- Camera on / off ---------- */
+function updateCamButton(){
+  const btn=$('camToggle');
+  btn.textContent=cameraOn?'Turn camera off':'Turn camera on';
+  btn.classList.toggle('off',cameraOn);
+  btn.disabled=false;
+}
+
+async function turnCameraOn(){
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    setStatus('camStatus','Camera not available. Open this page over HTTPS (for example a hosted link), not a plain http:// address.','bad');
+    return;
+  }
+  const btn=$('camToggle');
+  btn.disabled=true;
+  setStatus('camStatus','Waiting for camera permission...');
+  try{
+    localStream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},
+      audio:false
+    });
+    const track=localStream.getVideoTracks()[0];
+    track.addEventListener('ended',()=>{ if(cameraOn) turnCameraOff(); });
+
+    $('localVideo').srcObject=localStream;
+    $('localVideo').classList.remove('hidden');
+    $('camPreview').classList.add('hidden');
+    cameraOn=true;
+
+    if(sender){
+      // Already connected: send the new track without renegotiating.
+      await sender.replaceTrack(track);
+      setStatus('camStatus','Camera on. Viewer sees the live picture.','ok');
+    } else {
+      await createConnection(track);
+      setStatus('camStatus','Camera on. Copy the code below and send it to the viewer.','ok');
+    }
+    updateCamButton();
+    $('camCodeBox').classList.remove('hidden');
+    checkPermission();
+  }catch(err){
+    cameraOn=false;
+    updateCamButton();
+    if(err.name==='NotAllowedError'){
+      setStatus('camStatus','Camera permission was denied. Allow it when the browser asks, or in site settings.','bad');
+    } else if(err.name==='NotFoundError'){
+      setStatus('camStatus','No camera found on this device.','bad');
+    } else {
+      setStatus('camStatus','Could not start camera: '+err.message,'bad');
+    }
+  }
+}
+
+function turnCameraOff(){
+  if(localStream){
+    localStream.getTracks().forEach(t=>t.stop());   // releases the camera and its indicator light
+  }
+  localStream=null;
+  cameraOn=false;
+  if(sender) sender.replaceTrack(null);             // viewer sees a blank picture, connection stays up
+  $('localVideo').srcObject=null;
+  $('localVideo').classList.add('hidden');
+  $('camPreview').classList.remove('hidden');
+  updateCamButton();
+  setStatus('camStatus','Camera off. The camera is released and the viewer sees a blank picture.','warn');
+}
+
+$('camToggle').addEventListener('click',()=>{
+  if(cameraOn) turnCameraOff();
+  else turnCameraOn();
+});
+
+async function createConnection(track){
+  pc=new RTCPeerConnection(RTC_CONFIG);
+  sender=pc.addTrack(track,localStream);
+  pc.addEventListener('connectionstatechange',()=>{
+    if(pc.connectionState==='connected') setStatus('camStatus','Viewer connected. Streaming live.','ok');
+    if(pc.connectionState==='failed'||pc.connectionState==='disconnected') setStatus('camStatus','Connection lost. Try reconnecting.','bad');
+  });
+  const offer=await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitForIce(pc);
+  $('offerOut').value=encode(pc.localDescription);
+}
+
+$('copyOffer').addEventListener('click',()=>copyText($('offerOut').value,'camStatus'));
+
+$('connectCam').addEventListener('click',async()=>{
+  if(!pc){ setStatus('camStatus','Turn the camera on first.','bad'); return; }
+  try{
+    const answer=decode($('answerIn').value);
+    await pc.setRemoteDescription(answer);
+    setStatus('camStatus','Reply accepted. Waiting for the viewer to connect...');
+  }catch(err){
+    setStatus('camStatus','That reply code is not valid. Check you copied all of it.','bad');
+  }
+});
+
+/* ---------- Viewer phone ---------- */
+$('makeAnswer').addEventListener('click',async()=>{
+  try{
+    const offer=decode($('offerIn').value);
+    const viewer=new RTCPeerConnection(RTC_CONFIG);
+    viewer.addEventListener('track',e=>{
+      $('remoteVideo').srcObject=e.streams[0];
+      $('remoteVideo').classList.remove('hidden');
+    });
+    viewer.addEventListener('connectionstatechange',()=>{
+      if(viewer.connectionState==='connected') setStatus('viewStatus','Watching live.','ok');
+      if(viewer.connectionState==='failed'||viewer.connectionState==='disconnected') setStatus('viewStatus','Connection lost. Ask for a new code.','bad');
+    });
+    await viewer.setRemoteDescription(offer);
+    const answer=await viewer.createAnswer();
+    await viewer.setLocalDescription(answer);
+    await waitForIce(viewer);
+    $('answerOut').value=encode(viewer.localDescription);
+    $('replyBox').classList.remove('hidden');
+    setStatus('viewStatus','Send the reply code back to the camera phone.');
+  }catch(err){
+    setStatus('viewStatus','That code is not valid. Check you copied all of it.','bad');
+  }
+});
+
+$('copyAnswer').addEventListener('click',()=>copyText($('answerOut').value,'viewStatus'));
+
+async function copyText(text,statusId){
+  try{
+    await navigator.clipboard.writeText(text);
+    setStatus(statusId,'Copied.','ok');
+  }catch(err){
+    setStatus(statusId,'Copy failed. Select the text and copy it by hand.','bad');
+  }
+}
+
+$('mode').addEventListener('change',showPanel);
+showPanel();
+updateCamButton();
+checkPermission();
+</script>
+</body>
+</html>
